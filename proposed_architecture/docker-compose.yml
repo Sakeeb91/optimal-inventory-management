@@ -1,0 +1,190 @@
+version: '3.8'
+
+services:
+  # Database
+  db:
+    image: postgres:14-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${DB_USER:-inventory}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-inventory_password}
+      POSTGRES_DB: ${DB_NAME:-inventory_db}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    ports:
+      - "${DB_PORT:-5432}:5432"
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "${DB_USER:-inventory}"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  # API Gateway
+  api:
+    build:
+      context: ./api_gateway
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    ports:
+      - "${API_PORT:-8000}:8000"
+    environment:
+      DATABASE_URL: postgresql://${DB_USER:-inventory}:${DB_PASSWORD:-inventory_password}@db:5432/${DB_NAME:-inventory_db}
+      SECRET_KEY: ${SECRET_KEY:-default_dev_secret_key}
+      DEBUG: ${DEBUG:-false}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      OPTIMIZATION_SERVICE_URL: http://optimization:5000
+      FORECASTING_SERVICE_URL: http://forecasting:5001
+      ALLOW_ORIGINS: ${ALLOW_ORIGINS:-http://localhost:3000}
+    depends_on:
+      - db
+    volumes:
+      - ./api_gateway:/app
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # Optimization Engine Service
+  optimization:
+    build:
+      context: .
+      dockerfile: ./optimization_engine/Dockerfile
+    restart: unless-stopped
+    environment:
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      DATABASE_URL: postgresql://${DB_USER:-inventory}:${DB_PASSWORD:-inventory_password}@db:5432/${DB_NAME:-inventory_db}
+      WORKERS: ${OPTIMIZATION_WORKERS:-4}
+      MAX_MEMORY: ${OPTIMIZATION_MEMORY:-4096}
+      TIMEOUT: ${OPTIMIZATION_TIMEOUT:-3600}
+    volumes:
+      - ./optimization_engine:/app
+    depends_on:
+      - db
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:5000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # Forecasting Service
+  forecasting:
+    build:
+      context: ./forecasting
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    environment:
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      DATABASE_URL: postgresql://${DB_USER:-inventory}:${DB_PASSWORD:-inventory_password}@db:5432/${DB_NAME:-inventory_db}
+    volumes:
+      - ./forecasting:/app
+    depends_on:
+      - db
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:5001/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # Web Dashboard
+  web:
+    build:
+      context: ./web_dashboard
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    ports:
+      - "${WEB_PORT:-5000}:5000"
+    environment:
+      API_URL: http://api:8000
+    depends_on:
+      - api
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:5000"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # Scheduler for periodic tasks
+  scheduler:
+    build:
+      context: ./scheduler
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    environment:
+      DATABASE_URL: postgresql://${DB_USER:-inventory}:${DB_PASSWORD:-inventory_password}@db:5432/${DB_NAME:-inventory_db}
+      API_URL: http://api:8000
+    depends_on:
+      - api
+      - db
+    volumes:
+      - ./scheduler:/app
+
+  # ERP Data Connector
+  erp_connector:
+    build:
+      context: ./connectors
+      dockerfile: Dockerfile.erp
+    restart: unless-stopped
+    environment:
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      API_URL: http://api:8000
+      ERP_API_URL: ${ERP_API_URL}
+      ERP_API_KEY: ${ERP_API_KEY}
+      ERP_USERNAME: ${ERP_USERNAME}
+      ERP_PASSWORD: ${ERP_PASSWORD}
+      WAREHOUSE_ID: ${WAREHOUSE_ID}
+      PRODUCT_CATEGORY: ${PRODUCT_CATEGORY}
+    depends_on:
+      - api
+    volumes:
+      - ./connectors:/app
+
+  # Redis for caching and message queuing
+  redis:
+    image: redis:alpine
+    restart: unless-stopped
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  # Monitoring with Prometheus
+  prometheus:
+    image: prom/prometheus:latest
+    restart: unless-stopped
+    volumes:
+      - ./monitoring/prometheus:/etc/prometheus
+      - prometheus_data:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--web.console.libraries=/usr/share/prometheus/console_libraries'
+      - '--web.console.templates=/usr/share/prometheus/consoles'
+    ports:
+      - "9090:9090"
+    depends_on:
+      - api
+      - optimization
+      - forecasting
+      - web
+
+  # Visualization with Grafana
+  grafana:
+    image: grafana/grafana:latest
+    restart: unless-stopped
+    volumes:
+      - ./monitoring/grafana/provisioning:/etc/grafana/provisioning
+      - grafana_data:/var/lib/grafana
+    ports:
+      - "3000:3000"
+    depends_on:
+      - prometheus
+
+volumes:
+  postgres_data:
+  redis_data:
+  prometheus_data:
+  grafana_data: 
